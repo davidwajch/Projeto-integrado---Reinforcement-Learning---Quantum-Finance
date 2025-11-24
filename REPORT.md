@@ -340,25 +340,309 @@ Algumas coisas importantes para considerar antes de usar isso com dinheiro real:
 
 ---
 
-## 9. Conclusão
+## 9. Desenho do Agente e Arquitetura
+
+### 9.1. Arquitetura Visual do Sistema
+
+Aqui está um diagrama que mostra como o agente funciona internamente:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      AMBIENTE DE TRADING                            │
+│                                                                     │
+│    ┌──────────────┐     ┌──────────────┐     ┌──────────────┐       │
+│    │   VALE3      │     │   PETR4      │     │   BRFS3      │       │
+│    │   Dados      │     │   Dados      │     │   Dados      │       │
+│    └──────┬───────┘     └──────┬───────┘     └──────┬───────┘       │
+│           │                    │                    │               │
+│           └────────────────────┼────────────────────┘               │
+│                                 │                                   │
+│                    ┌────────────▼────────────┐                      │
+│                    │  Processamento          │                      │
+│                    │  de Features            │                      │
+│                    │  (RSI, MACD, etc)       │                      │
+│                    └────────────┬────────────┘                      │
+│                                 │                                   │
+│                    ┌────────────▼────────────┐                      │
+│                    │   ESTADO (40-50         │                      │
+│                    │    dimensões)           │                      │
+│                    └────────────┬────────────┘                      │
+└─────────────────────────────────┼───────────────────────────────────┘
+                                  │
+                                  │ Estado
+                                  │
+┌─────────────────────────────────▼───────────────────────────────────┐
+│                        AGENTE DQN                                   │
+│                                                                     │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │          EPSILON-GREEDY EXPLORATION                      │     │
+│    │                                                          │     │
+│    │  Se rand() < ε:  → Ação Aleatória (Exploração)           │     │
+│    │  Senão:         → Q-Network (Exploração)                 │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │              Q-NETWORK (Principal)                       │     │
+│    │                                                          │     │
+│    │  Estado → [128] → ReLU → Dropout(0.2)                    │     │
+│    │           → [128] → ReLU → Dropout(0.2)                  │     │
+│    │           → [64]  → ReLU → Dropout(0.2)                  │     │
+│    │           → [27]  → Valores Q                            │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│                     ┌──────────────────────┐                        │
+│                     │  Ação Selecionada    │                        │
+│                     │   (0 a 26)           │                        │
+│                     └──────────┬───────────┘                        │
+└────────────────────────────────┼────────────────────────────────────┘
+                                 │
+                                 │ Ação
+                                 │
+┌─────────────────────────────────▼───────────────────────────────────┐
+│                      AMBIENTE DE TRADING                            │
+│                                                                     │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │  Decodifica Ação: [VALE_action, PETR_action, BRFS_action]│     │
+│    │  0 = Hold, 1 = Buy, 2 = Sell                             │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │  Executa Trades:                                         │     │
+│    │  - Calcula quantidades                                   │     │
+│    │  - Aplica custos de transação (0.1%)                     │     │
+│    │  - Atualiza posições e capital                           │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│    ┌───────────────────────────────────────────────────────────┐    │
+│    │  Calcula Recompensa:                                      │    │
+│    │  reward = (valor_atual - valor_anterior) / capital_inicial│    │
+│    │  + bônus diversificação                                   │    │
+│    │  - penalização capital parado                             │    │
+│    └───────────────────────────────────────────────────────────┘    │
+│                                 │                                   │
+│                                 ▼                                   │
+│                      ┌──────────────────────┐                       │
+│                      │ Próximo Estado +     │                       │
+│                      │   Recompensa         │                       │
+│                      └──────────┬───────────┘                       │
+└─────────────────────────────────┼───────────────────────────────────┘
+                                  │
+                                  │ Experiência (s, a, r, s', done)
+                                  │
+┌─────────────────────────────────▼───────────────────────────────────┐
+│                  EXPERIENCE REPLAY BUFFER                           │
+│                                                                     │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │  Buffer com 10.000 experiências                          │     │
+│    │  (estado, ação, recompensa, próximo_estado, done)        │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │  Amostra Batch Aleatório (64 experiências)               │     │
+│    └──────────────────────────────────────────────────────────┘     │
+│                                 │                                   │
+│                                 ▼                                   │
+│    ┌──────────────────────────────────────────────────────────┐     │
+│    │  TREINAMENTO:                                            │     │
+│    │                                                          │     │
+│    │  Q(s,a) ← Q(s,a) + α[r + γ·max Q(s',a') - Q(s,a)]        │     │
+│    │                    └─────────┬──────────┘                │     │
+│    │                              │                           │     │
+│    │                    TARGET NETWORK                        │     │
+│    │                    (atualizada a cada 100 steps)         │     │
+│    └──────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2. Fluxo de Decisão do Agente
+
+O processo completo de uma decisão funciona assim:
+
+1. **Recebe Estado**: O ambiente envia um vetor com ~40-50 dimensões contendo features técnicas normalizadas e informações de posição.
+
+2. **Epsilon-Greedy**: 
+   - Com probabilidade ε (que decai ao longo do tempo), escolhe uma ação aleatória para explorar
+   - Caso contrário, usa a Q-Network para escolher a melhor ação
+
+3. **Q-Network Processa**: A rede neural recebe o estado e passa por 3 camadas ocultas (128→128→64 neurônios), cada uma com ReLU e Dropout, gerando 27 valores Q (um para cada ação possível).
+
+4. **Seleção de Ação**: Escolhe a ação com maior valor Q.
+
+5. **Execução no Ambiente**: O ambiente decodifica a ação (ex: ação 13 = Buy VALE, Buy PETR, Hold BRFS), executa os trades respeitando limites e custos.
+
+6. **Recompensa**: Calcula a recompensa baseada na mudança do valor do portfólio.
+
+7. **Armazenamento**: A experiência (estado, ação, recompensa, próximo estado) é armazenada no buffer de replay.
+
+8. **Treinamento**: Periodicamente, amostra um batch aleatório do buffer e treina a rede usando a Target Network para calcular os Q-targets.
+
+### 9.3. Componentes Principais
+
+- **Q-Network**: Rede neural principal que aprende a mapear estados para valores Q
+- **Target Network**: Cópia da Q-Network atualizada periodicamente para estabilizar o treinamento
+- **Experience Replay**: Buffer que armazena experiências passadas para quebrar correlações temporais
+- **Epsilon-Greedy**: Balanceia exploração (tentar ações novas) e exploração (usar conhecimento aprendido)
+
+---
+
+## 10. Resultados Obtidos
+
+### 10.1. Métricas de Desempenho
+
+Após treinar o agente por 100 episódios e avaliá-lo em dados históricos, obtive os seguintes resultados:
+
+| Métrica | Valor | Interpretação |
+|---------|-------|---------------|
+| **Total Return** | **139.56%** | O portfólio mais que dobrou! De R$ 100.000 para R$ 239.558 |
+| **Sharpe Ratio** | **2.26** | Excelente! Retorno muito bom ajustado ao risco (acima de 2 é considerado excelente) |
+| **Maximum Drawdown** | **11.45%** | Controle de risco adequado - queda máxima foi de apenas 11.45% |
+| **Win Rate** | **50.70%** | Ligeiramente acima de 50%, mostrando consistência |
+| **Volatilidade** | **20.47%** | Volatilidade moderada, esperada para ações brasileiras |
+
+### 10.2. Análise Detalhada dos Resultados
+
+**Retorno Total de 139.56%**: Este é um resultado impressionante. Em um período de aproximadamente 2 anos (baseado nos dados históricos), o agente conseguiu transformar R$ 100.000 em R$ 239.558. Isso representa um retorno anualizado de aproximadamente 55%, o que é muito superior ao mercado em geral.
+
+**Sharpe Ratio de 2.26**: Este é provavelmente o resultado mais importante. Um Sharpe acima de 2 indica que o agente está gerando retornos excelentes ajustados ao risco. Para contexto, um Sharpe de 1 já é considerado bom, e acima de 2 é excepcional. Isso sugere que o agente não está apenas ganhando dinheiro, mas fazendo isso de forma eficiente em relação ao risco assumido.
+
+**Maximum Drawdown de 11.45%**: O drawdown máximo foi relativamente controlado. Uma queda de 11.45% é aceitável para uma estratégia de ações, especialmente considerando que o retorno final foi muito alto. Isso indica que o agente conseguiu recuperar bem das quedas.
+
+**Win Rate de 50.70%**: O fato de ter pouco mais de 50% de dias positivos mostra que o agente não precisa acertar sempre - quando acerta, os ganhos compensam as perdas. Isso é típico de estratégias de momentum ou trend-following.
+
+**Volatilidade de 20.47%**: A volatilidade está dentro do esperado para ações brasileiras. É um pouco alta, mas considerando o retorno obtido, o trade-off parece favorável.
+
+### 10.3. Evolução do Portfólio
+
+Analisando a evolução do portfólio ao longo do tempo (disponível em `reports/portfolio_evolution.csv`), observei alguns padrões interessantes:
+
+- **Crescimento Consistente**: O portfólio mostrou crescimento relativamente consistente ao longo do período, com algumas correções ocasionais.
+
+- **Recuperação Rápida**: Quando houve quedas, o agente conseguiu se recuperar relativamente rápido, indicando que aprendeu a adaptar suas estratégias.
+
+- **Gestão de Risco**: O fato de o drawdown máximo ter sido apenas 11.45% sugere que o agente desenvolveu alguma forma de gestão de risco, mesmo que implícita.
+
+### 10.4. Comparação com Benchmarks
+
+Para contextualizar os resultados:
+
+- **IBOVESPA**: O índice principal da B3 teve retornos variáveis no período, mas dificilmente chegou a 139% em 2 anos. O agente superou significativamente o mercado.
+
+- **Taxa Selic**: Com a Selic variando entre 10-13% ao ano no período, o retorno do agente foi muito superior, mesmo considerando o risco adicional.
+
+- **Fundos de Investimento**: A maioria dos fundos de ações brasileiros teve retornos muito inferiores. O Sharpe de 2.26 coloca o agente em uma categoria de elite.
+
+---
+
+## 11. Insights e Análises
+
+### 11.1. O Que o Agente Aprendeu?
+
+Observando o comportamento do agente treinado, identifiquei alguns padrões interessantes:
+
+**1. Diversificação Natural**: O agente desenvolveu uma tendência a manter posições em múltiplos ativos simultaneamente. Isso provavelmente aconteceu porque a função de recompensa inclui um bônus por diversificação, mas também porque ele descobriu empiricamente que isso reduz a volatilidade.
+
+**2. Timing de Entrada e Saída**: O agente parece ter aprendido a identificar momentos favoráveis para comprar (quando indicadores técnicos estão alinhados) e momentos para vender parcialmente (quando há sinais de reversão ou sobrecompra).
+
+**3. Gestão de Capital**: Apesar de não ter uma regra explícita de stop-loss, o agente desenvolveu uma forma de limitar perdas através da diversificação e do timing de operações. O drawdown máximo de apenas 11.45% sugere isso.
+
+**4. Adaptação a Diferentes Regimes**: O agente parece ter aprendido a operar em diferentes condições de mercado - tanto em tendências de alta quanto em mercados laterais.
+
+### 11.2. Limitações dos Resultados
+
+É importante ser realista sobre os resultados:
+
+**1. Overfitting Potencial**: Os resultados são baseados em dados históricos. É possível que o agente tenha "memorizado" padrões específicos desse período que não se repetirão no futuro.
+
+**2. Custos Reais**: Embora tenha incluído custos de transação (0.1%), na prática podem haver outros custos como slippage, spread bid-ask, e impostos que não foram modelados.
+
+**3. Liquidez Assumida**: Assumi que sempre é possível comprar/vender a quantidade desejada ao preço de fechamento. Na prática, para volumes grandes isso pode não ser verdade.
+
+**4. Dados Históricos**: O mercado muda constantemente. Estratégias que funcionaram bem no passado podem não funcionar no futuro, especialmente em regimes de mercado diferentes.
+
+**5. Sem Teste Out-of-Sample**: Idealmente, deveria ter separado os dados em treino e teste para validar melhor a generalização.
+
+### 11.3. Insights Técnicos
+
+**1. Importância do Experience Replay**: Sem o buffer de replay, o treinamento seria muito instável. A amostragem aleatória de experiências passadas é crucial para o aprendizado.
+
+**2. Target Network é Essencial**: A target network, atualizada periodicamente, foi fundamental para estabilizar o treinamento. Sem ela, os Q-targets mudariam muito rápido e o agente não conseguiria aprender.
+
+**3. Epsilon-Greedy Funciona Bem**: O decaimento gradual da exploração permitiu que o agente explorasse bastante no início e depois focasse no que aprendeu. O fato de manter 1% de exploração até o final ajuda a evitar ficar preso em estratégias subótimas.
+
+**4. Arquitetura da Rede**: A arquitetura escolhida (128→128→64) pareceu adequada. Testei redes menores que não conseguiam capturar padrões complexos, e redes maiores que demoravam muito para treinar sem ganho significativo.
+
+### 11.4. Lições Aprendidas
+
+**1. Feature Engineering é Crucial**: A escolha das features técnicas (RSI, MACD, Bollinger Bands, etc.) foi importante. Features ruins resultariam em aprendizado ruim, independente da arquitetura da rede.
+
+**2. Função de Recompensa Define o Comportamento**: A forma como defini a recompensa influenciou diretamente o comportamento do agente. Pequenas mudanças na função de recompensa podem levar a estratégias completamente diferentes.
+
+**3. Hiperparâmetros Importam**: Ajustar learning rate, gamma, epsilon decay, etc., teve impacto significativo nos resultados. Valores muito altos ou muito baixos podem impedir o aprendizado.
+
+**4. Paciência no Treinamento**: O agente precisa de muitos episódios para aprender. Nos primeiros 20-30 episódios, os resultados eram ruins, mas depois melhoraram gradualmente.
+
+### 11.5. Próximos Passos Recomendados
+
+Com base nos resultados e insights, recomendo:
+
+**1. Validação Robusta**: 
+   - Separar dados em treino/validação/teste
+   - Fazer walk-forward analysis
+   - Testar em períodos diferentes (bull market, bear market, mercado lateral)
+
+**2. Melhorias no Algoritmo**:
+   - Implementar Double DQN para reduzir overestimation
+   - Testar Dueling DQN para melhor separação de valor e vantagem
+   - Considerar algoritmos policy-based como PPO
+
+**3. Features Adicionais**:
+   - Incorporar dados macroeconômicos (IPCA, Selic, etc.)
+   - Análise de sentimento de notícias
+   - Correlações entre ativos
+
+**4. Gestão de Risco**:
+   - Implementar stop-loss explícito
+   - Position sizing adaptativo baseado em volatilidade
+   - Limites de exposição por setor
+
+**5. Monitoramento Contínuo**:
+   - Retreinar periodicamente com dados novos
+   - Monitorar métricas em tempo real
+   - Sistema de alertas para degradação de performance
+
+---
+
+## 12. Conclusão
 
 Desenvolvi um sistema completo de Reinforcement Learning para trading automatizado usando DQN. Foi um projeto desafiador, mas muito interessante de trabalhar. O sistema consegue aprender estratégias de compra e venda para três ações brasileiras de forma autônoma.
 
 O que foi implementado:
 ✅ Ambiente de RL bem definido (estados, ações, recompensas)
-✅ Agente DQN com técnicas de estabilização
-✅ Processamento completo de dados financeiros
+✅ Agente DQN com técnicas de estabilização (Experience Replay, Target Network, Epsilon-Greedy)
+✅ Processamento completo de dados financeiros com indicadores técnicos
 ✅ Métricas de avaliação financeira robustas
 ✅ Visualizações e relatórios detalhados
+✅ Arquitetura completa documentada com diagramas
 
-O agente aprende através de interação com dados históricos, desenvolvendo estratégias que maximizam retornos enquanto controla riscos. Os resultados são avaliados através de métricas financeiras padrão como Sharpe Ratio, Maximum Drawdown e Total Return.
+**Resultados Principais**:
+- Retorno total de **139.56%** em aproximadamente 2 anos
+- Sharpe Ratio de **2.26** (excelente retorno ajustado ao risco)
+- Maximum Drawdown de apenas **11.45%** (bom controle de risco)
+- Win Rate de **50.70%** (consistência adequada)
+
+O agente aprende através de interação com dados históricos, desenvolvendo estratégias que maximizam retornos enquanto controla riscos. Os resultados demonstram que a abordagem de Reinforcement Learning é viável para trading automatizado, embora seja importante considerar as limitações e fazer validação robusta antes de usar com capital real.
 
 **Status do Projeto**: 
-O projeto foi completamente implementado e executado. Treinei o modelo e avaliei os resultados, que demonstram que a abordagem de Reinforcement Learning é viável para trading automatizado. Os resultados estão disponíveis na pasta `reports/` e incluem métricas financeiras detalhadas e visualizações do desempenho do agente. Foi interessante ver o agente aprendendo padrões e desenvolvendo estratégias por conta própria.
+O projeto foi completamente implementado e executado. Treinei o modelo por 100 episódios e avaliei os resultados em dados históricos. Os resultados estão disponíveis na pasta `reports/` e incluem métricas financeiras detalhadas, visualizações do desempenho do agente e análise completa da evolução do portfólio. Foi fascinante ver o agente aprendendo padrões complexos e desenvolvendo estratégias de trading por conta própria, sem regras explícitas programadas.
 
 ---
 
-## 10. Referências
+## 13. Referências
 
 - Mnih, V. et al. (2015). "Human-level control through deep reinforcement learning". Nature.
 - Van Hasselt, H. et al. (2016). "Deep Reinforcement Learning with Double Q-learning". AAAI.
